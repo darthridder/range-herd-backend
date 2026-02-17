@@ -1,3 +1,5 @@
+// src/server.ts  (OPTION A: TTN OPTIONAL - server always boots if DATABASE_URL exists)
+
 import "dotenv/config";
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
@@ -12,7 +14,7 @@ import { checkGeofences } from "./geofencing.js";
 import { generateInviteToken, getInviteExpiration, isInviteExpired } from "./invitations.js";
 
 /* ============================================================
-   1) ENVIRONMENT
+   1) ENVIRONMENT (Option A: TTN is OPTIONAL)
 ============================================================ */
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -20,19 +22,21 @@ const TTN_REGION = process.env.TTN_REGION ?? "nam1";
 const TTN_APP_ID = process.env.TTN_APP_ID ?? "";
 const TTN_TENANT = process.env.TTN_TENANT ?? "ttn";
 const TTN_API_KEY = process.env.TTN_API_KEY ?? "";
-const DATABASE_URL = process.env.DATABASE_URL ?? "";
+const DATABASE_URL = process.env.DATABASE_URL ?? process.env.DATABASE_URLpostgresql ?? ""; // extra guard
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 
-const missing = [
-  !TTN_APP_ID && "TTN_APP_ID",
-  !TTN_API_KEY && "TTN_API_KEY",
-  !DATABASE_URL && "DATABASE_URL",
-].filter(Boolean) as string[];
+// ✅ Only DATABASE_URL is required to boot the API in production
+const missing = [!DATABASE_URL && "DATABASE_URL"].filter(Boolean) as string[];
 
 if (missing.length) {
   console.error(`❌ Missing required env vars: ${missing.join(", ")}`);
   process.exit(1);
+}
+
+const TTN_ENABLED = Boolean(TTN_APP_ID && TTN_API_KEY);
+if (!TTN_ENABLED) {
+  console.warn("⚠️  TTN_APP_ID / TTN_API_KEY not set — MQTT uplink listener DISABLED (API still running)");
 }
 
 if (!JWT_SECRET) {
@@ -87,9 +91,7 @@ function broadcast(obj: unknown): void {
   const msg = JSON.stringify(obj);
   for (const ws of wsClients) {
     try {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(msg);
-      }
+      if (ws.readyState === ws.OPEN) ws.send(msg);
     } catch {
       wsClients.delete(ws);
     }
@@ -157,6 +159,7 @@ async function authenticate(req: any, reply: any): Promise<TokenPayload | null> 
 ============================================================ */
 
 async function main() {
+  console.log("Entered main()");
   const app = Fastify({ logger: true });
 
   await app.register(cors, {
@@ -177,6 +180,7 @@ async function main() {
     ts: new Date().toISOString(),
     wsClients: wsClients.size,
     uptime: process.uptime(),
+    ttnEnabled: TTN_ENABLED,
   }));
 
   /* ───────────────────────────────────────────────────────────
@@ -187,18 +191,11 @@ async function main() {
     const body = req.body as any;
     const { email, password, name, ranchName } = body;
 
-    if (!email || !password) {
-      return reply.code(400).send({ error: "Email and password required" });
-    }
-
-    if (password.length < 8) {
-      return reply.code(400).send({ error: "Password must be at least 8 characters" });
-    }
+    if (!email || !password) return reply.code(400).send({ error: "Email and password required" });
+    if (password.length < 8) return reply.code(400).send({ error: "Password must be at least 8 characters" });
 
     const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) {
-      return reply.code(409).send({ error: "Email already registered" });
-    }
+    if (existing) return reply.code(409).send({ error: "Email already registered" });
 
     const passwordHash = hashPassword(password);
 
@@ -208,9 +205,7 @@ async function main() {
         passwordHash,
         name: name || null,
         ownedRanches: {
-          create: {
-            name: ranchName || `${name || email}'s Ranch`,
-          },
+          create: { name: ranchName || `${name || email}'s Ranch` },
         },
       },
       include: { ownedRanches: true },
@@ -234,9 +229,7 @@ async function main() {
     const body = req.body as any;
     const { email, password } = body;
 
-    if (!email || !password) {
-      return reply.code(400).send({ error: "Email and password required" });
-    }
+    if (!email || !password) return reply.code(400).send({ error: "Email and password required" });
 
     const user = await prisma.user.findUnique({
       where: { email },
@@ -270,9 +263,7 @@ async function main() {
       include: { ownedRanches: true },
     });
 
-    if (!user) {
-      return reply.code(404).send({ error: "User not found" });
-    }
+    if (!user) return reply.code(404).send({ error: "User not found" });
 
     return {
       id: user.id,
@@ -284,292 +275,172 @@ async function main() {
   });
 
   /* ───────────────────────────────────────────────────────────
-     TEAM & INVITATION ROUTES (PROTECTED)
+     WEBSOCKET LIVE FEED
   ─────────────────────────────────────────────────────────── */
 
-  // Get team members for user's ranch
-  app.get("/team/members", async (req, reply) => {
-    const payload = await authenticate(req, reply);
-    if (!payload) return;
+  app.get("/live", { websocket: true }, (socket, req) => {
+    const ws = socket as unknown as WebSocket;
+    app.log.info({ ip: req.ip }, "WS CONNECT");
 
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      include: { ownedRanches: true },
-    });
+    wsClients.add(ws);
 
-    if (!user || !user.ownedRanches[0]) {
-      return reply.code(404).send({ error: "Ranch not found" });
+    try {
+      ws.send(JSON.stringify({ type: "hello", ts: new Date().toISOString() }));
+    } catch (e) {
+      app.log.error(e, "WS hello send failed");
     }
 
-    const members = await prisma.ranchMember.findMany({
-      where: { ranchId: user.ownedRanches[0].id },
-      include: {
-        user: {
-          select: { id: true, email: true, name: true },
-        },
-      },
-      orderBy: { createdAt: "asc" },
+    ws.on("close", () => {
+      wsClients.delete(ws);
+      app.log.info("WS CLOSE");
     });
 
-    return members.map((m: any) => ({
-      id: m.id,
-      userId: m.user.id,
-      email: m.user.email,
-      name: m.user.name,
-      role: m.role,
-      createdAt: m.createdAt,
-    }));
+    ws.on("error", (err) => {
+      app.log.error(err, "WS ERROR");
+      wsClients.delete(ws);
+    });
   });
 
-  // Send invitation
-  app.post("/team/invite", async (req, reply) => {
-    const payload = await authenticate(req, reply);
-    if (!payload) return;
+  /* ───────────────────────────────────────────────────────────
+     MQTT (OPTION A: only start if TTN_ENABLED)
+  ─────────────────────────────────────────────────────────── */
 
-    const body = req.body as any;
-    const { email, role } = body;
+  let mqttClient: mqtt.MqttClient | null = null;
 
-    if (!email || !role) {
-      return reply.code(400).send({ error: "Email and role required" });
-    }
-
-    if (role !== "viewer" && role !== "owner") {
-      return reply.code(400).send({ error: "Role must be 'viewer' or 'owner'" });
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      include: { ownedRanches: true },
+  if (TTN_ENABLED) {
+    mqttClient = mqtt.connect(MQTT_URL, {
+      username: MQTT_USERNAME,
+      password: TTN_API_KEY,
+      protocolVersion: 4,
+      reconnectPeriod: 2000,
+      connectTimeout: 30000,
     });
 
-    if (!user || !user.ownedRanches[0]) {
-      return reply.code(404).send({ error: "Ranch not found" });
-    }
-
-    // Check if user is already a member
-    const existingMember = await prisma.ranchMember.findFirst({
-      where: {
-        ranchId: user.ownedRanches[0].id,
-        user: { email },
-      },
-    });
-
-    if (existingMember) {
-      return reply.code(409).send({ error: "User is already a team member" });
-    }
-
-    // Check for pending invitation
-    const existingInvite = await prisma.invitation.findFirst({
-      where: {
-        ranchId: user.ownedRanches[0].id,
-        email,
-        status: "pending",
-      },
-    });
-
-    if (existingInvite) {
-      return reply.code(409).send({ error: "Invitation already sent to this email" });
-    }
-
-    const token = generateInviteToken();
-    const expiresAt = getInviteExpiration();
-
-    const invitation = await prisma.invitation.create({
-      data: {
-        ranchId: user.ownedRanches[0].id,
-        invitedBy: user.id,
-        email,
-        role,
-        token,
-        expiresAt,
-      },
-    });
-
-    // In production, you'd send an email here
-    const inviteUrl = `${(req as any).protocol}://${(req as any).hostname}/accept-invite/${token}`;
-
-    return {
-      invitation: {
-        id: invitation.id,
-        email: invitation.email,
-        role: invitation.role,
-        expiresAt: invitation.expiresAt,
-      },
-      inviteUrl,
-      message: "Invitation created. Share the invite link.",
-    };
-  });
-
-  // List pending invitations
-  app.get("/team/invitations", async (req, reply) => {
-    const payload = await authenticate(req, reply);
-    if (!payload) return;
-
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      include: { ownedRanches: true },
-    });
-
-    if (!user || !user.ownedRanches[0]) {
-      return reply.code(404).send({ error: "Ranch not found" });
-    }
-
-    const invitations = await prisma.invitation.findMany({
-      where: {
-        ranchId: user.ownedRanches[0].id,
-        status: "pending",
-      },
-      include: {
-        sender: {
-          select: { name: true, email: true },
-        },
-      },
-      orderBy: { createdAt: "desc" },
-    });
-
-    return invitations.map((inv: any) => ({
-      id: inv.id,
-      email: inv.email,
-      role: inv.role,
-      status: inv.status,
-      expiresAt: inv.expiresAt,
-      invitedBy: inv.sender.name || inv.sender.email,
-      createdAt: inv.createdAt,
-    }));
-  });
-
-  // Cancel invitation
-  app.delete("/team/invitations/:id", async (req, reply) => {
-    const payload = await authenticate(req, reply);
-    if (!payload) return;
-
-    const { id } = req.params as { id: string };
-
-    const invitation = await prisma.invitation.findUnique({
-      where: { id },
-      include: { ranch: { include: { owner: true } } },
-    });
-
-    if (!invitation || invitation.ranch.ownerId !== payload.userId) {
-      return reply.code(404).send({ error: "Invitation not found" });
-    }
-
-    await prisma.invitation.delete({ where: { id } });
-
-    return { success: true };
-  });
-
-  // Accept invitation (PUBLIC)
-  app.post("/team/accept/:token", async (req, reply) => {
-    const { token } = req.params as { token: string };
-    const body = req.body as any;
-    const { email, password, name } = body;
-
-    const invitation = await prisma.invitation.findUnique({
-      where: { token },
-      include: { ranch: true },
-    });
-
-    if (!invitation) {
-      return reply.code(404).send({ error: "Invalid invitation" });
-    }
-
-    if (invitation.status !== "pending") {
-      return reply.code(400).send({ error: "Invitation already used" });
-    }
-
-    if (isInviteExpired(invitation.expiresAt)) {
-      await prisma.invitation.update({
-        where: { id: invitation.id },
-        data: { status: "expired" },
+    mqttClient.on("connect", () => {
+      app.log.info(`✅ MQTT connected: ${MQTT_HOST}`);
+      mqttClient!.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
+        if (err) app.log.error(err, "MQTT subscribe failed");
+        else app.log.info(`📡 MQTT subscribed: ${MQTT_TOPIC}`);
       });
-      return reply.code(400).send({ error: "Invitation expired" });
-    }
+    });
 
-    if (invitation.email !== email) {
-      return reply.code(400).send({ error: "Email does not match invitation" });
-    }
+    mqttClient.on("reconnect", () => app.log.warn("MQTT reconnecting..."));
+    mqttClient.on("offline", () => app.log.warn("MQTT offline"));
+    mqttClient.on("error", (err) => app.log.error(err, "MQTT error"));
 
-    // Check if user exists
-    let user = await prisma.user.findUnique({ where: { email } });
+    mqttClient.on("message", async (_topic, payload) => {
+      try {
+        const uplink = JSON.parse(payload.toString("utf8")) as unknown;
+        const n = normalizeUplink(uplink);
 
-    if (!user) {
-      // Create new user
-      if (!password || password.length < 8) {
-        return reply.code(400).send({ error: "Password must be at least 8 characters" });
+        if (!n.deviceId) {
+          app.log.warn("Uplink missing deviceId — skipped");
+          return;
+        }
+
+        await prisma.device.upsert({
+          where: { deviceId: n.deviceId },
+          create: {
+            deviceId: n.deviceId,
+            devEui: n.devEui,
+            lastSeen: n.receivedAt,
+            ranchId: null,
+          },
+          update: {
+            devEui: n.devEui ?? undefined,
+            lastSeen: n.receivedAt,
+          },
+        });
+
+        await prisma.telemetry.create({
+          data: {
+            deviceId: n.deviceId,
+            receivedAt: n.receivedAt,
+            lat: n.lat,
+            lon: n.lon,
+            altM: n.altM,
+            batteryV: n.batteryV,
+            batteryPct: n.batteryPct,
+            tempC: n.tempC,
+            humidityPct: n.humidityPct,
+            pressureHpa: n.pressureHpa,
+            rssi: n.rssi,
+            snr: n.snr,
+            fCnt: n.fCnt,
+            raw: n.raw as object,
+          },
+        });
+
+        // GEOFENCE CHECK — only if device has GPS and is assigned to a ranch
+        if (n.lat != null && n.lon != null) {
+          const device = await prisma.device.findUnique({
+            where: { deviceId: n.deviceId },
+            include: { ranch: true },
+          });
+
+          if (device?.ranchId) {
+            const geofences = await prisma.geofence.findMany({
+              where: { ranchId: device.ranchId },
+            });
+
+            const { inside } = checkGeofences(n.lat, n.lon, geofences);
+
+            const recentAlert = await prisma.alert.findFirst({
+              where: {
+                deviceId: n.deviceId,
+                type: "geofence_exit",
+                createdAt: { gte: new Date(Date.now() - 10 * 60 * 1000) },
+              },
+            });
+
+            if (!inside && !recentAlert && geofences.length > 0) {
+              const alert = await prisma.alert.create({
+                data: {
+                  ranchId: device.ranchId,
+                  deviceId: n.deviceId,
+                  geofenceId: geofences[0].id,
+                  type: "geofence_exit",
+                  severity: "high",
+                  message: `${n.deviceId} has left the geofenced area`,
+                  lat: n.lat,
+                  lon: n.lon,
+                },
+              });
+
+              broadcast({ type: "alert", data: alert });
+              app.log.warn({ deviceId: n.deviceId, lat: n.lat, lon: n.lon }, "GEOFENCE VIOLATION");
+            }
+          }
+        }
+
+        broadcast({ type: "uplink", data: n });
+        app.log.info({ deviceId: n.deviceId, lat: n.lat, lon: n.lon }, "Uplink saved");
+      } catch (err) {
+        app.log.error(err, "MQTT uplink handling error");
       }
-
-      const passwordHash = hashPassword(password);
-
-      user = await prisma.user.create({
-        data: {
-          email,
-          passwordHash,
-          name: name || null,
-        },
-      });
-    }
-
-    // Add user to ranch
-    await prisma.ranchMember.create({
-      data: {
-        ranchId: invitation.ranchId,
-        userId: user.id,
-        role: invitation.role,
-      },
     });
+  }
 
-    // Mark invitation as accepted
-    await prisma.invitation.update({
-      where: { id: invitation.id },
-      data: {
-        status: "accepted",
-        acceptedAt: new Date(),
-      },
-    });
+  /* ───────────────────────────────────────────────────────────
+     START (THIS is the app.listen)
+  ─────────────────────────────────────────────────────────── */
 
-    const jwtToken = await signToken({ userId: user.id, email: user.email });
+  console.log("About to listen...");
+  await app.listen({ port: PORT, host: "0.0.0.0" });
+  app.log.info(`🚀 Server running at http://0.0.0.0:${PORT}`);
 
-    return {
-      token: jwtToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        ranchId: invitation.ranchId,
-        ranchName: invitation.ranch.name,
-      },
-      message: "Successfully joined the ranch",
-    };
-  });
+  const shutdown = async (signal: string) => {
+    app.log.info(`${signal} received — shutting down gracefully`);
+    try {
+      mqttClient?.end();
+    } catch {}
+    await app.close();
+    await prisma.$disconnect();
+    process.exit(0);
+  };
 
-  // Remove team member
-  app.delete("/team/members/:id", async (req, reply) => {
-    const payload = await authenticate(req, reply);
-    if (!payload) return;
-
-    const { id } = req.params as { id: string };
-
-    const member = await prisma.ranchMember.findUnique({
-      where: { id },
-      include: { ranch: { include: { owner: true } } },
-    });
-
-    if (!member || member.ranch.ownerId !== payload.userId) {
-      return reply.code(404).send({ error: "Team member not found" });
-    }
-
-    // Can't remove the owner
-    if (member.userId === member.ranch.ownerId) {
-      return reply.code(400).send({ error: "Cannot remove ranch owner" });
-    }
-
-    await prisma.ranchMember.delete({ where: { id } });
-
-    return { success: true };
-  });
-
-  /* ... rest of your file continues unchanged ... */
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 main().catch((err) => {
