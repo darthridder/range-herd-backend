@@ -182,14 +182,7 @@ async function main() {
     uptime: process.uptime(),
     ttnEnabled: TTN_ENABLED,
   }));
-  app.get("/api/health", async () => ({
-    ok: true,
-    ts: new Date().toISOString(),
-    wsClients: wsClients.size,
-    uptime: process.uptime(),
-    ttnEnabled: TTN_ENABLED,
-  }));
-
+ 
   // Same health endpoint but under /api so the frontend can hit it consistently in prod
   app.get("/api/health", async () => ({
     ok: true,
