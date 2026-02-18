@@ -22,7 +22,7 @@ const TTN_REGION = process.env.TTN_REGION ?? "nam1";
 const TTN_APP_ID = process.env.TTN_APP_ID ?? "";
 const TTN_TENANT = process.env.TTN_TENANT ?? "ttn";
 const TTN_API_KEY = process.env.TTN_API_KEY ?? "";
-const DATABASE_URL = process.env.DATABASE_URL ?? process.env.DATABASE_URLpostgresql ?? ""; // extra guard
+const DATABASE_URL = process.env.DATABASE_URL ?? (process.env as any).DATABASE_URLpostgresql ?? ""; // extra guard
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 
@@ -182,12 +182,60 @@ async function main() {
     uptime: process.uptime(),
     ttnEnabled: TTN_ENABLED,
   }));
+  app.get("/api/health", async () => ({
+    ok: true,
+    ts: new Date().toISOString(),
+    wsClients: wsClients.size,
+    uptime: process.uptime(),
+    ttnEnabled: TTN_ENABLED,
+  }));
+
+  // Same health endpoint but under /api so the frontend can hit it consistently in prod
+  app.get("/api/health", async () => ({
+    ok: true,
+    ts: new Date().toISOString(),
+    wsClients: wsClients.size,
+    uptime: process.uptime(),
+    ttnEnabled: TTN_ENABLED,
+  }));
+
+  // Helper: resolve a user's primary ranch (owner first, else first membership)
+  async function getPrimaryRanchId(userId: string): Promise<string | null> {
+    const owned = await prisma.ranch.findFirst({
+      where: { ownerId: userId },
+      select: { id: true },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owned?.id) return owned.id;
+
+    const member = await prisma.ranchMember.findFirst({
+      where: { userId },
+      select: { ranchId: true },
+      orderBy: { createdAt: "asc" },
+    });
+    return member?.ranchId ?? null;
+  }
+
+  async function requireAuth(
+    req: any,
+    reply: any
+  ): Promise<{ payload: TokenPayload; ranchId: string } | null> {
+    const payload = await authenticate(req, reply);
+    if (!payload) return null;
+
+    const ranchId = await getPrimaryRanchId(payload.userId);
+    if (!ranchId) {
+      reply.code(403).send({ error: "No ranch access" });
+      return null;
+    }
+    return { payload, ranchId };
+  }
 
   /* ───────────────────────────────────────────────────────────
      AUTH ROUTES (PUBLIC)
   ─────────────────────────────────────────────────────────── */
 
-  app.post("/auth/register", async (req, reply) => {
+  app.post("/api/auth/register", async (req, reply) => {
     const body = req.body as any;
     const { email, password, name, ranchName } = body;
 
@@ -225,7 +273,7 @@ async function main() {
     };
   });
 
-  app.post("/auth/login", async (req, reply) => {
+  app.post("/api/auth/login", async (req, reply) => {
     const body = req.body as any;
     const { email, password } = body;
 
@@ -254,7 +302,7 @@ async function main() {
     };
   });
 
-  app.get("/auth/me", async (req, reply) => {
+  app.get("/api/auth/me", async (req, reply) => {
     const payload = await authenticate(req, reply);
     if (!payload) return;
 
@@ -278,7 +326,7 @@ async function main() {
      WEBSOCKET LIVE FEED
   ─────────────────────────────────────────────────────────── */
 
-  app.get("/live", { websocket: true }, (socket, req) => {
+  app.get("/api/live", { websocket: true }, (socket, req) => {
     const ws = socket as unknown as WebSocket;
     app.log.info({ ip: req.ip }, "WS CONNECT");
 
@@ -299,6 +347,291 @@ async function main() {
       app.log.error(err, "WS ERROR");
       wsClients.delete(ws);
     });
+  });
+
+  /* ───────────────────────────────────────────────────────────
+     DEVICES (AUTH)
+  ─────────────────────────────────────────────────────────── */
+
+  app.get("/api/devices", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const devices = await prisma.device.findMany({
+      where: { ranchId: ctx.ranchId },
+      select: { deviceId: true, devEui: true, name: true, lastSeen: true },
+      orderBy: [{ lastSeen: "desc" }, { deviceId: "asc" }],
+    });
+
+    return devices.map((d) => ({
+      deviceId: d.deviceId,
+      devEui: d.devEui ?? null,
+      name: d.name ?? null,
+      lastSeen: d.lastSeen ? d.lastSeen.toISOString() : "",
+    }));
+  });
+
+  app.get("/api/devices/:deviceId/latest", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const deviceId = (req.params as any).deviceId as string;
+
+    const device = await prisma.device.findUnique({
+      where: { deviceId },
+      select: { ranchId: true },
+    });
+    if (!device || device.ranchId !== ctx.ranchId) {
+      return reply.code(404).send({ error: "Device not found" });
+    }
+
+    const t = await prisma.telemetry.findFirst({
+      where: { deviceId },
+      orderBy: { receivedAt: "desc" },
+    });
+
+    if (!t) return null;
+
+    return {
+      deviceId: t.deviceId,
+      receivedAt: t.receivedAt.toISOString(),
+      lat: t.lat ?? null,
+      lon: t.lon ?? null,
+      altM: t.altM ?? null,
+      batteryV: t.batteryV ?? null,
+      batteryPct: t.batteryPct ?? null,
+      tempC: t.tempC ?? null,
+      humidityPct: (t as any).humidityPct ?? null,
+      pressureHpa: (t as any).pressureHpa ?? null,
+      rssi: t.rssi ?? null,
+      snr: t.snr ?? null,
+      fCnt: t.fCnt ?? null,
+    };
+  });
+
+  /* ───────────────────────────────────────────────────────────
+     GEOFENCES (AUTH)
+  ─────────────────────────────────────────────────────────── */
+
+  app.get("/api/geofences", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    return prisma.geofence.findMany({
+      where: { ranchId: ctx.ranchId },
+      orderBy: { createdAt: "desc" },
+    });
+  });
+
+  app.delete("/api/geofences/:id", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const id = (req.params as any).id as string;
+
+    const fence = await prisma.geofence.findUnique({ where: { id } });
+    if (!fence || fence.ranchId !== ctx.ranchId) {
+      return reply.code(404).send({ error: "Geofence not found" });
+    }
+
+    await prisma.geofence.delete({ where: { id } });
+    return { ok: true };
+  });
+
+  /* ───────────────────────────────────────────────────────────
+     ALERTS (AUTH)
+  ─────────────────────────────────────────────────────────── */
+
+  app.get("/api/alerts", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const unreadOnly = (req.query as any)?.unreadOnly === "true";
+
+    return prisma.alert.findMany({
+      where: {
+        ranchId: ctx.ranchId,
+        ...(unreadOnly ? { isRead: false } : {}),
+      },
+      orderBy: { createdAt: "desc" },
+      include: {
+        device: { select: { name: true, deviceId: true } },
+        geofence: { select: { name: true } },
+      },
+      take: 200,
+    });
+  });
+
+  app.patch("/api/alerts/:id/read", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const id = (req.params as any).id as string;
+
+    const alert = await prisma.alert.findUnique({ where: { id } });
+    if (!alert || alert.ranchId !== ctx.ranchId) {
+      return reply.code(404).send({ error: "Alert not found" });
+    }
+
+    await prisma.alert.update({ where: { id }, data: { isRead: true } });
+    return { ok: true };
+  });
+
+  app.post("/api/alerts/read-all", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    await prisma.alert.updateMany({
+      where: { ranchId: ctx.ranchId, isRead: false },
+      data: { isRead: true },
+    });
+    return { ok: true };
+  });
+
+  /* ───────────────────────────────────────────────────────────
+     TEAM (AUTH)
+  ─────────────────────────────────────────────────────────── */
+
+  app.get("/api/team/members", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const ranch = await prisma.ranch.findUnique({
+      where: { id: ctx.ranchId },
+      include: {
+        owner: { select: { id: true, email: true, name: true, createdAt: true } },
+        members: { include: { user: { select: { id: true, email: true, name: true, createdAt: true } } } },
+      },
+    });
+    if (!ranch) return reply.code(404).send({ error: "Ranch not found" });
+
+    const list = [
+      {
+        id: `owner:${ranch.owner.id}`,
+        userId: ranch.owner.id,
+        email: ranch.owner.email,
+        name: ranch.owner.name ?? null,
+        role: "owner",
+        createdAt: ranch.owner.createdAt.toISOString(),
+      },
+      ...ranch.members.map((m) => ({
+        id: m.id,
+        userId: m.userId,
+        email: m.user.email,
+        name: m.user.name ?? null,
+        role: m.role,
+        createdAt: m.createdAt.toISOString(),
+      })),
+    ];
+
+    const seen = new Set<string>();
+    return list.filter((x) => {
+      if (seen.has(x.userId)) return false;
+      seen.add(x.userId);
+      return true;
+    });
+  });
+
+  app.get("/api/team/invitations", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const invites = await prisma.invitation.findMany({
+      where: { ranchId: ctx.ranchId },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+
+    // Mark expired on read (cleanup)
+    const expiredIds = invites
+      .filter((i) => i.status === "pending" && isInviteExpired(i.expiresAt))
+      .map((i) => i.id);
+
+    if (expiredIds.length) {
+      await prisma.invitation.updateMany({
+        where: { id: { in: expiredIds } },
+        data: { status: "expired" },
+      });
+    }
+
+    return prisma.invitation.findMany({
+      where: { ranchId: ctx.ranchId },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+  });
+
+  app.post("/api/team/invite", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const body = req.body as any;
+    const email = (body?.email as string | undefined)?.trim()?.toLowerCase();
+    const role = (body?.role as string | undefined) === "owner" ? "owner" : "viewer";
+    if (!email) return reply.code(400).send({ error: "Email required" });
+
+    // Only allow the ranch owner to invite
+    const ranch = await prisma.ranch.findUnique({ where: { id: ctx.ranchId }, select: { ownerId: true } });
+    if (!ranch) return reply.code(404).send({ error: "Ranch not found" });
+    if (ranch.ownerId !== ctx.payload.userId) {
+      return reply.code(403).send({ error: "Only the ranch owner can invite" });
+    }
+
+    const token = generateInviteToken();
+    const expiresAt = getInviteExpiration();
+
+    const inv = await prisma.invitation.create({
+      data: {
+        ranchId: ctx.ranchId,
+        invitedBy: ctx.payload.userId,
+        email,
+        role,
+        token,
+        expiresAt,
+      },
+    });
+
+    const frontendUrl = (process.env.FRONTEND_URL ?? "").trim();
+    const inviteUrl = frontendUrl ? `${frontendUrl.replace(/\/$/, "")}/?invite=${token}` : token;
+
+    return { ok: true, invitation: inv, inviteUrl };
+  });
+
+  app.delete("/api/team/invitations/:id", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const id = (req.params as any).id as string;
+
+    const inv = await prisma.invitation.findUnique({ where: { id } });
+    if (!inv || inv.ranchId !== ctx.ranchId) return reply.code(404).send({ error: "Invitation not found" });
+
+    await prisma.invitation.delete({ where: { id } });
+    return { ok: true };
+  });
+
+  app.delete("/api/team/members/:id", async (req, reply) => {
+    const ctx = await requireAuth(req, reply);
+    if (!ctx) return;
+
+    const id = (req.params as any).id as string;
+
+    // Only owner can remove
+    const ranch = await prisma.ranch.findUnique({ where: { id: ctx.ranchId }, select: { ownerId: true } });
+    if (!ranch) return reply.code(404).send({ error: "Ranch not found" });
+    if (ranch.ownerId !== ctx.payload.userId) {
+      return reply.code(403).send({ error: "Only the ranch owner can remove members" });
+    }
+
+    if (id.startsWith("owner:")) {
+      return reply.code(400).send({ error: "Cannot remove ranch owner" });
+    }
+
+    const member = await prisma.ranchMember.findUnique({ where: { id } });
+    if (!member || member.ranchId !== ctx.ranchId) return reply.code(404).send({ error: "Member not found" });
+
+    await prisma.ranchMember.delete({ where: { id } });
+    return { ok: true };
   });
 
   /* ───────────────────────────────────────────────────────────
