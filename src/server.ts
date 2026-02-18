@@ -1,45 +1,105 @@
+// src/server.ts (Railway-safe: Fastify + WebSocket + Prisma v7 driver adapter)
+
+import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
+import rateLimit from "@fastify/rate-limit";
+
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import type { WebSocket } from "ws";
 
-const prisma = new PrismaClient();
+/* =========================
+   ENV
+========================= */
 
-const app = Fastify({
-  logger: true,
-});
+const PORT = Number(process.env.PORT ?? 8080);
+const DATABASE_URL =
+  process.env.DATABASE_URL ?? process.env.DATABASE_URLpostgresql ?? "";
+const CORS_ORIGIN =
+  process.env.CORS_ORIGIN ??
+  "http://localhost:5173,https://range-herd-frontend-production.up.railway.app";
 
-const PORT = Number(process.env.PORT) || 8080;
+/* =========================
+   REQUIRED ENV CHECKS
+========================= */
 
-// ===============================
-// CORS (Railway frontend support)
-// ===============================
-app.register(cors, {
-  origin: true, // allow Railway frontend domain
+if (!DATABASE_URL) {
+  console.error("❌ Missing required env var: DATABASE_URL");
+  process.exit(1);
+}
+
+/* =========================
+   PRISMA (FIX FOR YOUR CRASH)
+   Prisma v7 + adapter-pg => you MUST pass { adapter }
+========================= */
+
+const adapter = new PrismaPg({ connectionString: DATABASE_URL });
+const prisma = new PrismaClient({ adapter });
+
+/* =========================
+   FASTIFY
+========================= */
+
+const app = Fastify({ logger: true });
+
+/* =========================
+   CORS
+========================= */
+
+const allowedOrigins = CORS_ORIGIN.split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+await app.register(cors, {
+  origin: (origin, cb) => {
+    // allow curl/postman/no-origin
+    if (!origin) return cb(null, true);
+
+    // allow configured origins
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+
+    // block everything else
+    return cb(new Error(`CORS blocked for origin: ${origin}`), false);
+  },
   credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 });
 
-// ===============================
-// WebSocket Support
-// ===============================
-app.register(websocket);
+await app.register(rateLimit, {
+  global: true,
+  max: 200,
+  timeWindow: "1 minute",
+});
 
-// Track connected clients
-const wsClients = new Set<any>();
+await app.register(websocket);
 
-const liveWsHandler = (socket: any, req: any) => {
-  const ws = socket as any;
+/* =========================
+   WEBSOCKET LIVE FEED
+========================= */
 
+const wsClients = new Set<WebSocket>();
+
+function broadcast(obj: unknown) {
+  const msg = JSON.stringify(obj);
+  for (const ws of wsClients) {
+    try {
+      if (ws.readyState === ws.OPEN) ws.send(msg);
+    } catch {
+      wsClients.delete(ws);
+    }
+  }
+}
+
+function liveWsHandler(socket: any, req: any) {
+  const ws = socket as WebSocket;
   app.log.info({ ip: req.ip }, "WS CONNECT");
   wsClients.add(ws);
 
   try {
-    ws.send(
-      JSON.stringify({
-        type: "hello",
-        ts: new Date().toISOString(),
-      })
-    );
+    ws.send(JSON.stringify({ type: "hello", ts: new Date().toISOString() }));
   } catch (e) {
     app.log.error(e, "WS hello send failed");
   }
@@ -49,64 +109,70 @@ const liveWsHandler = (socket: any, req: any) => {
     app.log.info("WS CLOSE");
   });
 
-  ws.on("error", (err: any) => {
-    app.log.error(err, "WS ERROR");
+  ws.on("error", (err) => {
     wsClients.delete(ws);
+    app.log.error(err, "WS ERROR");
   });
-};
+}
 
-// Canonical route
+// Canonical + backwards compatible
 app.get("/api/live", { websocket: true }, liveWsHandler);
-
-// Backwards compatibility
 app.get("/live", { websocket: true }, liveWsHandler);
 
-// ===============================
-// Health Route (ONLY ONCE)
-// ===============================
-app.get("/api/health", async () => {
-  return {
-    ok: true,
-    ts: new Date().toISOString(),
-    wsClients: wsClients.size,
-    uptime: process.uptime(),
-  };
-});
+/* =========================
+   HEALTH ROUTES (ONLY ONCE)
+========================= */
 
-// Optional root health
-app.get("/health", async () => {
-  return {
-    ok: true,
-    ts: new Date().toISOString(),
-  };
-});
+app.get("/api/health", async () => ({
+  ok: true,
+  ts: new Date().toISOString(),
+  wsClients: wsClients.size,
+  uptime: process.uptime(),
+}));
 
-// ===============================
-// Example DB Test Route
-// ===============================
+app.get("/health", async () => ({
+  ok: true,
+  ts: new Date().toISOString(),
+}));
+
+/* =========================
+   DB CHECK (OPTIONAL)
+========================= */
+
 app.get("/api/db-check", async () => {
   const result = await prisma.$queryRaw`SELECT 1 as status`;
   return result;
 });
 
-// ===============================
-// Start Server (Railway Safe)
-// ===============================
-const start = async () => {
+/* =========================
+   START (Railway-safe)
+========================= */
+
+async function main() {
   try {
     await prisma.$connect();
-    app.log.info("Prisma connected");
+    app.log.info("✅ Prisma connected");
 
-    await app.listen({
-      port: PORT,
-      host: "0.0.0.0", // REQUIRED for Railway
-    });
-
-    app.log.info(`Server running on port ${PORT}`);
+    await app.listen({ port: PORT, host: "0.0.0.0" });
+    app.log.info(`🚀 Server listening on 0.0.0.0:${PORT}`);
   } catch (err) {
-    app.log.error(err);
+    app.log.error(err, "❌ Fatal startup error");
     process.exit(1);
   }
-};
 
-start();
+  const shutdown = async (signal: string) => {
+    app.log.info(`${signal} received — shutting down`);
+    try {
+      await app.close();
+    } catch {}
+    try {
+      await prisma.$disconnect();
+    } catch {}
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+}
+
+main();
