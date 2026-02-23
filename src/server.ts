@@ -10,9 +10,19 @@ import mqtt from "mqtt";
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 
-import { hashPassword, verifyPassword, signToken, verifyToken, type TokenPayload } from "./auth.js";
+import {
+  hashPassword,
+  verifyPassword,
+  signToken,
+  verifyToken,
+  type TokenPayload,
+} from "./auth.js";
 import { checkGeofences } from "./geofencing.js";
-import { generateInviteToken, getInviteExpiration, isInviteExpired } from "./invitations.js";
+import {
+  generateInviteToken,
+  getInviteExpiration,
+  isInviteExpired,
+} from "./invitations.js";
 
 /* ============================================================
    1) ENV
@@ -44,7 +54,9 @@ if (!JWT_SECRET) {
 
 const TTN_ENABLED = Boolean(TTN_APP_ID && TTN_API_KEY);
 if (!TTN_ENABLED) {
-  console.warn("⚠️  TTN_APP_ID / TTN_API_KEY not set — MQTT uplink listener DISABLED (API still runs)");
+  console.warn(
+    "⚠️  TTN_APP_ID / TTN_API_KEY not set — MQTT uplink listener DISABLED (API still runs)"
+  );
 }
 
 /* ============================================================
@@ -79,6 +91,30 @@ type NormalizedUplink = {
   fCnt: number | null;
 
   raw: unknown;
+};
+
+/**
+ * Shape the UI expects from GET /api/live/latest (Dashboard.tsx)
+ * Keep field names compatible with your frontend.
+ */
+type LivePointForUI = {
+  deviceId: string;
+  lat: number;
+  lon: number;
+  altM: number | null;
+  receivedAt: string;
+
+  batteryPct: number | null;
+  batteryV: number | null;
+
+  rssi: number | null;
+  snr: number | null;
+
+  // UI sometimes uses temperatureC; your DB uses tempC
+  temperatureC: number | null;
+
+  // Optional extras (safe)
+  fCnt: number | null;
 };
 
 /* ============================================================
@@ -187,6 +223,32 @@ async function getPrimaryRanchId(userId: string): Promise<string> {
 }
 
 /* ============================================================
+   7b) HELPERS FOR LIVE ENDPOINTS
+============================================================ */
+
+function telemetryToLivePointForUI(t: any): LivePointForUI | null {
+  // Only return points that have GPS
+  if (t?.lat == null || t?.lon == null) return null;
+
+  return {
+    deviceId: String(t.deviceId),
+    lat: Number(t.lat),
+    lon: Number(t.lon),
+    altM: t.altM ?? null,
+    receivedAt: new Date(t.receivedAt).toISOString(),
+
+    batteryPct: t.batteryPct ?? null,
+    batteryV: t.batteryV ?? null,
+
+    rssi: t.rssi ?? null,
+    snr: t.snr ?? null,
+
+    temperatureC: t.tempC ?? null,
+    fCnt: t.fCnt ?? null,
+  };
+}
+
+/* ============================================================
    8) MAIN SERVER
 ============================================================ */
 
@@ -285,8 +347,10 @@ async function main() {
         const body = req.body as any;
         const { email, password, name, ranchName } = body;
 
-        if (!email || !password) return reply.code(400).send({ error: "Email and password required" });
-        if (password.length < 8) return reply.code(400).send({ error: "Password must be at least 8 characters" });
+        if (!email || !password)
+          return reply.code(400).send({ error: "Email and password required" });
+        if (password.length < 8)
+          return reply.code(400).send({ error: "Password must be at least 8 characters" });
 
         const existing = await prisma.user.findUnique({ where: { email } });
         if (existing) return reply.code(409).send({ error: "Email already registered" });
@@ -333,7 +397,8 @@ async function main() {
         const body = req.body as any;
         const { email, password } = body;
 
-        if (!email || !password) return reply.code(400).send({ error: "Email and password required" });
+        if (!email || !password)
+          return reply.code(400).send({ error: "Email and password required" });
 
         const user = await prisma.user.findUnique({
           where: { email },
@@ -420,7 +485,8 @@ async function main() {
         const deviceId = (req.params as any).deviceId as string;
 
         const device = await prisma.device.findUnique({ where: { deviceId } });
-        if (!device || device.ranchId !== ranchId) return reply.code(404).send({ error: "Device not found" });
+        if (!device || device.ranchId !== ranchId)
+          return reply.code(404).send({ error: "Device not found" });
 
         const latest = await prisma.telemetry.findFirst({
           where: { deviceId },
@@ -428,6 +494,45 @@ async function main() {
         });
 
         return latest;
+      });
+
+      /* ----------------------------
+         ✅ LIVE DATA (AUTH)
+         This is what your Dashboard expects:
+         GET /api/live/latest
+      ---------------------------- */
+
+      api.get("/live/latest", async (req, reply) => {
+        const payload = await authenticate(req, reply);
+        if (!payload) return;
+
+        const ranchId = await getPrimaryRanchId(payload.userId);
+
+        // Find ranch devices
+        const ranchDevices = await prisma.device.findMany({
+          where: { ranchId },
+          select: { deviceId: true },
+        });
+
+        const deviceIds = ranchDevices.map((d) => d.deviceId);
+        if (deviceIds.length === 0) return [];
+
+        // Grab recent telemetry for these devices
+        const rows = await prisma.telemetry.findMany({
+          where: {
+            deviceId: { in: deviceIds },
+          },
+          orderBy: { receivedAt: "desc" },
+          take: 200,
+        });
+
+        const out: LivePointForUI[] = [];
+        for (const t of rows) {
+          const p = telemetryToLivePointForUI(t);
+          if (p) out.push(p);
+        }
+
+        return out;
       });
 
       /* ----------------------------
@@ -456,11 +561,14 @@ async function main() {
         const { name, type, centerLat, centerLon, radiusM, polygon } = body;
 
         if (!name || !type) return reply.code(400).send({ error: "name and type are required" });
-        if (type !== "circle" && type !== "polygon") return reply.code(400).send({ error: "type must be circle|polygon" });
+        if (type !== "circle" && type !== "polygon")
+          return reply.code(400).send({ error: "type must be circle|polygon" });
 
         if (type === "circle") {
           if (centerLat == null || centerLon == null || radiusM == null) {
-            return reply.code(400).send({ error: "circle requires centerLat, centerLon, radiusM" });
+            return reply
+              .code(400)
+              .send({ error: "circle requires centerLat, centerLon, radiusM" });
           }
         }
 
@@ -491,7 +599,8 @@ async function main() {
         const id = (req.params as any).id as string;
 
         const fence = await prisma.geofence.findUnique({ where: { id } });
-        if (!fence || fence.ranchId !== ranchId) return reply.code(404).send({ error: "Geofence not found" });
+        if (!fence || fence.ranchId !== ranchId)
+          return reply.code(404).send({ error: "Geofence not found" });
 
         await prisma.geofence.delete({ where: { id } });
         return { ok: true };
@@ -529,7 +638,8 @@ async function main() {
         const id = (req.params as any).id as string;
 
         const alert = await prisma.alert.findUnique({ where: { id } });
-        if (!alert || alert.ranchId !== ranchId) return reply.code(404).send({ error: "Alert not found" });
+        if (!alert || alert.ranchId !== ranchId)
+          return reply.code(404).send({ error: "Alert not found" });
 
         await prisma.alert.update({ where: { id }, data: { isRead: true } });
         return { ok: true };
@@ -623,7 +733,8 @@ async function main() {
         const id = (req.params as any).id as string;
 
         const invite = await prisma.invitation.findUnique({ where: { id } });
-        if (!invite || invite.ranchId !== ranchId) return reply.code(404).send({ error: "Invitation not found" });
+        if (!invite || invite.ranchId !== ranchId)
+          return reply.code(404).send({ error: "Invitation not found" });
 
         await prisma.invitation.delete({ where: { id } });
         return { ok: true };
@@ -638,8 +749,10 @@ async function main() {
 
         const invite = await prisma.invitation.findUnique({ where: { token } });
         if (!invite) return reply.code(404).send({ error: "Invite not found" });
-        if (invite.status !== "pending") return reply.code(400).send({ error: "Invite is not pending" });
-        if (isInviteExpired(invite.expiresAt)) return reply.code(400).send({ error: "Invite expired" });
+        if (invite.status !== "pending")
+          return reply.code(400).send({ error: "Invite is not pending" });
+        if (isInviteExpired(invite.expiresAt))
+          return reply.code(400).send({ error: "Invite expired" });
 
         await prisma.ranchMember.upsert({
           where: { ranchId_userId: { ranchId: invite.ranchId, userId: payload.userId } },
@@ -663,7 +776,8 @@ async function main() {
         const id = (req.params as any).id as string;
 
         const member = await prisma.ranchMember.findUnique({ where: { id } });
-        if (!member || member.ranchId !== ranchId) return reply.code(404).send({ error: "Member not found" });
+        if (!member || member.ranchId !== ranchId)
+          return reply.code(404).send({ error: "Member not found" });
 
         await prisma.ranchMember.delete({ where: { id } });
         return { ok: true };
