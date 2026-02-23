@@ -1,0 +1,178 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Authentication & Multi-Tenant ───────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownedRanches Ranch[]       @relation("RanchOwner")
+  memberships  RanchMember[]
+  sentInvites  Invitation[]  @relation("InviteSender")
+}
+
+model Ranch {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner       User          @relation("RanchOwner", fields: [ownerId], references: [id])
+  members     RanchMember[]
+  devices     Device[]
+  geofences   Geofence[]
+  alerts      Alert[]
+  invitations Invitation[]
+}
+
+model RanchMember {
+  id        String   @id @default(cuid())
+  ranchId   String
+  userId    String
+  role      String   @default("viewer") // "owner" | "viewer"
+  createdAt DateTime @default(now())
+
+  ranch Ranch @relation(fields: [ranchId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([ranchId, userId])
+}
+
+model Invitation {
+  id         String    @id @default(cuid())
+  ranchId    String
+  invitedBy  String
+  email      String
+  role       String    @default("viewer") // "owner" | "viewer"
+  token      String    @unique
+  status     String    @default("pending") // "pending" | "accepted" | "expired"
+  expiresAt  DateTime
+  acceptedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  ranch  Ranch @relation(fields: [ranchId], references: [id], onDelete: Cascade)
+  sender User  @relation("InviteSender", fields: [invitedBy], references: [id])
+
+  @@index([token])
+  @@index([ranchId, status])
+}
+
+// ─── Geofencing & Alerts ──────────────────────────────────────────────────────
+
+model Geofence {
+  id                   String                @id @default(cuid())
+  ranchId              String
+  name                 String
+  type                 String // "circle" | "polygon"
+  centerLat            Float? // For circle type
+  centerLon            Float? // For circle type
+  radiusM              Float? // For circle type (meters)
+  polygon              Json? // For polygon type: array of [lat, lon]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  deviceGeofenceStates DeviceGeofenceState[]
+
+  ranch  Ranch   @relation(fields: [ranchId], references: [id], onDelete: Cascade)
+  alerts Alert[]
+
+  @@index([ranchId])
+}
+
+model Alert {
+  id         String   @id @default(cuid())
+  ranchId    String
+  deviceId   String
+  geofenceId String
+  type       String // "geofence_exit" | "geofence_enter" | "low_battery" | "inactivity"
+  severity   String   @default("medium") // "low" | "medium" | "high"
+  message    String
+  lat        Float?
+  lon        Float?
+  isRead     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  ranch    Ranch    @relation(fields: [ranchId], references: [id], onDelete: Cascade)
+  device   Device   @relation(fields: [deviceId], references: [deviceId])
+  geofence Geofence @relation(fields: [geofenceId], references: [id], onDelete: Cascade)
+
+  @@index([ranchId, isRead])
+  @@index([deviceId])
+  @@index([createdAt])
+}
+
+// Tracks last known inside/outside state per (device, geofence)
+// so we can emit ENTER/EXIT alerts only on transitions.
+model DeviceGeofenceState {
+  id         String   @id @default(cuid())
+  deviceId   String
+  geofenceId String
+  isInside   Boolean
+  updatedAt  DateTime @updatedAt
+
+  device   Device   @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  geofence Geofence @relation(fields: [geofenceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, geofenceId])
+  @@index([geofenceId])
+  @@index([deviceId])
+}
+
+// ─── IoT Devices ──────────────────────────────────────────────────────────────
+
+model Device {
+  id                   String                @id @default(cuid())
+  deviceId             String                @unique
+  devEui               String?
+  name                 String?
+  ranchId              String?
+  lastSeen             DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  deviceGeofenceStates DeviceGeofenceState[]
+
+  ranch     Ranch?      @relation(fields: [ranchId], references: [id], onDelete: SetNull)
+  telemetry Telemetry[]
+  alerts    Alert[]
+
+  @@index([ranchId])
+}
+
+model Telemetry {
+  id         String   @id @default(cuid())
+  deviceId   String
+  receivedAt DateTime
+
+  lat  Float?
+  lon  Float?
+  altM Float?
+
+  batteryV   Float?
+  batteryPct Float?
+
+  tempC       Float?
+  humidityPct Float?
+  pressureHpa Float?
+
+  rssi Float?
+  snr  Float?
+  fCnt Int?
+
+  raw Json?
+
+  createdAt DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [deviceId])
+
+  @@index([deviceId, receivedAt])
+}
