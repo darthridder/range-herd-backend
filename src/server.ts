@@ -200,9 +200,13 @@ async function main() {
   const app = Fastify({ logger: true });
 
   await app.register(cors, {
-    origin: CORS_ORIGIN.split(",").map((o: string) => o.trim()),
-    credentials: true,
-  });
+  origin: CORS_ORIGIN.split(",").map((o: string) => o.trim()),
+  credentials: true,
+
+  // REQUIRED for DELETE / PUT / PATCH to work from browser
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+});
 
   await app.register(rateLimit, { global: true, max: 100, timeWindow: "1 minute" });
   await app.register(websocket);
