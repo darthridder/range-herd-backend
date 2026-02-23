@@ -1,5 +1,4 @@
-// src/server.ts  (Railway-safe: Fastify + Prisma(Postgres) + WebSocket + TTN MQTT optional)
-
+// src/server.ts
 import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -25,7 +24,7 @@ import {
 } from "./invitations.js";
 
 /* ============================================================
-   1) ENV
+   ENV
 ============================================================ */
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -60,14 +59,40 @@ if (!TTN_ENABLED) {
 }
 
 /* ============================================================
-   2) PRISMA (Driver Adapter) — prevents Prisma init errors
+   PRISMA (Driver Adapter)
 ============================================================ */
 
 const adapter = new PrismaPg({ connectionString: DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
 /* ============================================================
-   3) TYPES
+   MQTT / TTN
+============================================================ */
+
+const MQTT_HOST = `${TTN_REGION}.cloud.thethings.network`;
+const MQTT_URL = `mqtts://${MQTT_HOST}:8883`;
+const MQTT_USERNAME = `${TTN_APP_ID}@${TTN_TENANT}`;
+const MQTT_TOPIC = `v3/${TTN_APP_ID}@${TTN_TENANT}/devices/+/up`;
+
+/* ============================================================
+   WS CLIENTS
+============================================================ */
+
+const wsClients = new Set<any>();
+
+function broadcast(obj: unknown): void {
+  const msg = JSON.stringify(obj);
+  for (const ws of wsClients) {
+    try {
+      if (ws?.readyState === 1) ws.send(msg); // 1 = OPEN
+    } catch {
+      wsClients.delete(ws);
+    }
+  }
+}
+
+/* ============================================================
+   TYPES / NORMALIZE
 ============================================================ */
 
 type NormalizedUplink = {
@@ -92,62 +117,6 @@ type NormalizedUplink = {
 
   raw: unknown;
 };
-
-/**
- * Shape the UI expects from GET /api/live/latest (Dashboard.tsx)
- * Keep field names compatible with your frontend.
- */
-type LivePointForUI = {
-  deviceId: string;
-  lat: number;
-  lon: number;
-  altM: number | null;
-  receivedAt: string;
-
-  batteryPct: number | null;
-  batteryV: number | null;
-
-  rssi: number | null;
-  snr: number | null;
-
-  // UI sometimes uses temperatureC; your DB uses tempC
-  temperatureC: number | null;
-
-  // Optional extras (safe)
-  fCnt: number | null;
-};
-
-/* ============================================================
-   4) TTN MQTT
-============================================================ */
-
-const MQTT_HOST = `${TTN_REGION}.cloud.thethings.network`;
-const MQTT_URL = `mqtts://${MQTT_HOST}:8883`;
-const MQTT_USERNAME = `${TTN_APP_ID}@${TTN_TENANT}`;
-const MQTT_TOPIC = `v3/${TTN_APP_ID}@${TTN_TENANT}/devices/+/up`;
-
-/* ============================================================
-   5) WEBSOCKET CLIENTS + BROADCAST
-============================================================ */
-
-const wsClients = new Set<any>();
-
-function broadcast(obj: unknown): void {
-  const msg = JSON.stringify(obj);
-  for (const ws of wsClients) {
-    try {
-      // ws.OPEN is not reliable across types; 1 = OPEN
-      if (ws?.readyState === 1) ws.send(msg);
-    } catch {
-      wsClients.delete(ws);
-    }
-  }
-}
-
-/* ============================================================
-   6) NORMALIZE TTN PAYLOAD
-   IMPORTANT: requires TTN decoded_payload.gps.lat/lon to exist
-============================================================ */
 
 function normalizeUplink(u: unknown): NormalizedUplink {
   const raw = u as any;
@@ -186,7 +155,7 @@ function normalizeUplink(u: unknown): NormalizedUplink {
 }
 
 /* ============================================================
-   7) AUTH HELPERS
+   AUTH HELPERS
 ============================================================ */
 
 async function authenticate(req: any, reply: any): Promise<TokenPayload | null> {
@@ -223,33 +192,7 @@ async function getPrimaryRanchId(userId: string): Promise<string> {
 }
 
 /* ============================================================
-   7b) HELPERS FOR LIVE ENDPOINTS
-============================================================ */
-
-function telemetryToLivePointForUI(t: any): LivePointForUI | null {
-  // Only return points that have GPS
-  if (t?.lat == null || t?.lon == null) return null;
-
-  return {
-    deviceId: String(t.deviceId),
-    lat: Number(t.lat),
-    lon: Number(t.lon),
-    altM: t.altM ?? null,
-    receivedAt: new Date(t.receivedAt).toISOString(),
-
-    batteryPct: t.batteryPct ?? null,
-    batteryV: t.batteryV ?? null,
-
-    rssi: t.rssi ?? null,
-    snr: t.snr ?? null,
-
-    temperatureC: t.tempC ?? null,
-    fCnt: t.fCnt ?? null,
-  };
-}
-
-/* ============================================================
-   8) MAIN SERVER
+   MAIN
 ============================================================ */
 
 async function main() {
@@ -264,7 +207,7 @@ async function main() {
   await app.register(rateLimit, { global: true, max: 100, timeWindow: "1 minute" });
   await app.register(websocket);
 
-  // Root health (works without /api)
+  // Root health
   app.get("/health", async () => ({
     ok: true,
     ts: new Date().toISOString(),
@@ -273,23 +216,18 @@ async function main() {
     ttnEnabled: TTN_ENABLED,
   }));
 
-  // WebSocket legacy endpoint (optional)
+  // Optional WS legacy endpoint
   app.get("/live", { websocket: true }, (socket, req) => {
     const ws = socket as any;
     app.log.info({ ip: req.ip }, "WS CONNECT (/live)");
     wsClients.add(ws);
-
     try {
       ws.send(JSON.stringify({ type: "hello", ts: new Date().toISOString() }));
-    } catch (e) {
-      app.log.error(e, "WS hello send failed");
-    }
-
+    } catch {}
     ws.on("close", () => {
       wsClients.delete(ws);
       app.log.info("WS CLOSE (/live)");
     });
-
     ws.on("error", (err: any) => {
       app.log.error(err, "WS ERROR (/live)");
       wsClients.delete(ws);
@@ -297,11 +235,10 @@ async function main() {
   });
 
   /* ============================================================
-     ALL API ROUTES UNDER /api
+     API ROUTES UNDER /api
   ============================================================ */
   app.register(
     async (api) => {
-      // API health
       api.get("/health", async () => ({
         ok: true,
         ts: new Date().toISOString(),
@@ -310,7 +247,7 @@ async function main() {
         ttnEnabled: TTN_ENABLED,
       }));
 
-      // Canonical WS endpoint expected by frontend: /api/live
+      // Canonical WS endpoint expected by UI: /api/live
       api.get("/live", { websocket: true }, (socket, req) => {
         const ws = socket as any;
         api.log.info({ ip: req.ip }, "WS CONNECT (/api/live)");
@@ -318,9 +255,7 @@ async function main() {
 
         try {
           ws.send(JSON.stringify({ type: "hello", ts: new Date().toISOString() }));
-        } catch (e) {
-          api.log.error(e, "WS hello send failed");
-        }
+        } catch {}
 
         ws.on("close", () => {
           wsClients.delete(ws);
@@ -333,7 +268,6 @@ async function main() {
         });
       });
 
-      // Quick DB check
       api.get("/db-check", async () => {
         const result = await prisma.$queryRaw`SELECT 1 as status`;
         return result;
@@ -369,7 +303,7 @@ async function main() {
           include: { ownedRanches: true },
         });
 
-        // Ensure owner is also a member (for team views)
+        // Ensure owner is a member
         const ranchId = user.ownedRanches[0]?.id;
         if (ranchId) {
           await prisma.ranchMember.upsert({
@@ -411,7 +345,6 @@ async function main() {
 
         const token = await signToken({ userId: user.id, email: user.email });
 
-        // Prefer owned ranch; else membership ranch
         const ranchId = user.ownedRanches[0]?.id ?? user.memberships[0]?.ranchId ?? null;
         const ranch = ranchId ? await prisma.ranch.findUnique({ where: { id: ranchId } }) : null;
 
@@ -477,6 +410,68 @@ async function main() {
         return devices;
       });
 
+      // ✅ Unclaimed devices (AUTH)
+      api.get("/devices/unclaimed", async (req, reply) => {
+        const payload = await authenticate(req, reply);
+        if (!payload) return;
+
+        const rows = await prisma.device.findMany({
+          where: { ranchId: null },
+          orderBy: [{ lastSeen: "desc" }, { createdAt: "desc" }],
+          select: {
+            deviceId: true,
+            devEui: true,
+            name: true,
+            lastSeen: true,
+            createdAt: true,
+          },
+          take: 200,
+        });
+
+        return rows;
+      });
+
+      // ✅ Claim a device to the caller’s ranch (AUTH)
+      api.post("/devices/claim", async (req, reply) => {
+        const payload = await authenticate(req, reply);
+        if (!payload) return;
+
+        const ranchId = await getPrimaryRanchId(payload.userId);
+
+        const body = req.body as any;
+        const deviceId = String(body?.deviceId ?? "").trim();
+        const name = body?.name != null ? String(body.name).trim() : null;
+
+        if (!deviceId) return reply.code(400).send({ error: "deviceId is required" });
+
+        const device = await prisma.device.findUnique({ where: { deviceId } });
+        if (!device) return reply.code(404).send({ error: "Device not found" });
+
+        if (device.ranchId && device.ranchId !== ranchId) {
+          return reply.code(409).send({ error: "Device already claimed by another ranch" });
+        }
+
+        const updated = await prisma.device.update({
+          where: { deviceId },
+          data: {
+            ranchId,
+            ...(name ? { name } : {}),
+          },
+          select: {
+            deviceId: true,
+            devEui: true,
+            name: true,
+            lastSeen: true,
+            ranchId: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+
+        return { ok: true, device: updated };
+      });
+
+      // Optional convenience
       api.get("/devices/:deviceId/latest", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -498,7 +493,6 @@ async function main() {
 
       /* ----------------------------
          ✅ LIVE DATA (AUTH)
-         This is what your Dashboard expects:
          GET /api/live/latest
       ---------------------------- */
 
@@ -508,7 +502,6 @@ async function main() {
 
         const ranchId = await getPrimaryRanchId(payload.userId);
 
-        // Find ranch devices
         const ranchDevices = await prisma.device.findMany({
           where: { ranchId },
           select: { deviceId: true },
@@ -517,7 +510,6 @@ async function main() {
         const deviceIds = ranchDevices.map((d) => d.deviceId);
         if (deviceIds.length === 0) return [];
 
-        // Grab recent telemetry for these devices
         const rows = await prisma.telemetry.findMany({
           where: {
             deviceId: { in: deviceIds },
@@ -526,13 +518,22 @@ async function main() {
           take: 200,
         });
 
-        const out: LivePointForUI[] = [];
-        for (const t of rows) {
-          const p = telemetryToLivePointForUI(t);
-          if (p) out.push(p);
-        }
-
-        return out;
+        // Match UI shape
+        return rows
+          .filter((t) => t.lat != null && t.lon != null)
+          .map((t) => ({
+            deviceId: t.deviceId,
+            lat: t.lat!,
+            lon: t.lon!,
+            altM: t.altM ?? null,
+            receivedAt: new Date(t.receivedAt).toISOString(),
+            batteryPct: t.batteryPct ?? null,
+            batteryV: t.batteryV ?? null,
+            rssi: t.rssi ?? null,
+            snr: t.snr ?? null,
+            temperatureC: t.tempC ?? null,
+            fCnt: t.fCnt ?? null,
+          }));
       });
 
       /* ----------------------------
@@ -560,7 +561,8 @@ async function main() {
 
         const { name, type, centerLat, centerLon, radiusM, polygon } = body;
 
-        if (!name || !type) return reply.code(400).send({ error: "name and type are required" });
+        if (!name || !type)
+          return reply.code(400).send({ error: "name and type are required" });
         if (type !== "circle" && type !== "polygon")
           return reply.code(400).send({ error: "type must be circle|polygon" });
 
@@ -740,7 +742,6 @@ async function main() {
         return { ok: true };
       });
 
-      // Accept invite token (public-ish, but we still require auth so invites can attach to a user)
       api.post("/team/accept/:token", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -823,7 +824,7 @@ async function main() {
           return;
         }
 
-        // Upsert device
+        // Upsert device (IMPORTANT: ranchId stays null until claimed)
         await prisma.device.upsert({
           where: { deviceId: n.deviceId },
           create: {
@@ -858,7 +859,7 @@ async function main() {
           },
         });
 
-        // Geofence checks only if GPS exists and device is assigned to a ranch
+        // Optional: geofence checks
         if (n.lat != null && n.lon != null) {
           const device = await prisma.device.findUnique({
             where: { deviceId: n.deviceId },
@@ -910,9 +911,8 @@ async function main() {
   }
 
   /* ============================================================
-     START (Railway: host 0.0.0.0 + process.env.PORT)
+     START
   ============================================================ */
-
   console.log("About to listen...");
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`🚀 Server running at http://0.0.0.0:${PORT}`);
