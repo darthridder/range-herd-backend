@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "postinstall": "prisma generate",
     "build": "prisma generate && tsc",
-    "start": "prisma migrate deploy && node dist/server.js",
+    "start": "npm run build && prisma migrate deploy && node dist/server.js",
     "railway:build": "npm run build",
     "railway:start": "npm run build && npm run start",
     "db:generate": "prisma generate",
