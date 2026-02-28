@@ -10,7 +10,7 @@
     "build": "prisma generate && tsc",
     "start": "prisma migrate deploy && node dist/server.js",
     "railway:build": "npm run build",
-    "railway:start": "npm run start",
+    "railway:start": "npm run build && npm run start",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:migrate:prod": "prisma migrate deploy",
