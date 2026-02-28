@@ -709,6 +709,73 @@ async function main() {
         return fence;
       });
 
+            // ✅ Import/Replace Ranch Property Boundary (Owner-only)
+      // POST /api/geofences/import-property
+      // Body: { geojson: FeatureCollection | Feature | Geometry, name?: string }
+      api.post("/geofences/import-property", async (req, reply) => {
+        const payload = await authenticate(req, reply);
+        if (!payload) return;
+
+        const ranchId = await getPrimaryRanchId(payload.userId);
+
+        // Owner-only check
+        const ranch = await prisma.ranch.findUnique({
+          where: { id: ranchId },
+          select: { ownerId: true },
+        });
+
+        if (!ranch) return reply.code(404).send({ error: "Ranch not found" });
+        if (ranch.ownerId !== payload.userId) {
+          return reply
+            .code(403)
+            .send({ error: "Only the ranch owner can set the property boundary" });
+        }
+
+        const body = req.body as any;
+        const geojson = body?.geojson;
+        const name = String(body?.name ?? "Property Boundary").trim() || "Property Boundary";
+
+        if (!geojson) return reply.code(400).send({ error: "geojson is required" });
+
+        // Normalize to a GeoJSON Geometry object
+        let geometry: any = null;
+
+        if (geojson.type === "FeatureCollection") {
+          geometry = geojson.features?.[0]?.geometry ?? null;
+        } else if (geojson.type === "Feature") {
+          geometry = geojson.geometry ?? null;
+        } else if (geojson.type === "Polygon" || geojson.type === "MultiPolygon") {
+          geometry = geojson;
+        }
+
+        if (!geometry) {
+          return reply.code(400).send({ error: "Invalid GeoJSON: no geometry found" });
+        }
+
+        if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") {
+          return reply.code(400).send({ error: "Only Polygon or MultiPolygon supported" });
+        }
+
+        // Keep ONE canonical property boundary per ranch (replace on re-import)
+        await prisma.geofence.deleteMany({
+          where: { ranchId, name: "Property Boundary" },
+        });
+
+        const fence = await prisma.geofence.create({
+          data: {
+            ranchId,
+            name: "Property Boundary", // canonical name (consistent)
+            type: "polygon",
+            polygon: geometry, // store GeoJSON geometry as-is ([lon,lat])
+            centerLat: null,
+            centerLon: null,
+            radiusM: null,
+          },
+        });
+
+        return fence;
+      });
+
       api.delete("/geofences/:id", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
