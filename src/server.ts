@@ -3,8 +3,11 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
+import jwt from "@fastify/jwt";
 import rateLimit from "@fastify/rate-limit";
 import mqtt from "mqtt";
+import registerCattle from "./cattle";
+import { maybeBootstrapPostgis } from "./postgisBootstrap";
 
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -198,6 +201,10 @@ async function getPrimaryRanchId(userId: string): Promise<string> {
 async function main() {
   console.log("Entered main()");
   const app = Fastify({ logger: true });
+ // 🔥 Enable PostGIS one-time when BOOTSTRAP_POSTGIS=true
+  await maybeBootstrapPostgis();
+  
+  await app.register(jwt, { secret: JWT_SECRET });
 
   await app.register(cors, {
   origin: CORS_ORIGIN.split(",").map((o: string) => o.trim()),
@@ -210,6 +217,10 @@ async function main() {
 
   await app.register(rateLimit, { global: true, max: 100, timeWindow: "1 minute" });
   await app.register(websocket);
+  
+  console.log("🔥 calling registerCattle(app) now");
+ await registerCattle(app, getPrimaryRanchId);
+  console.log("🔥 registerCattle(app) finished");
 
   // Root health
   app.get("/health", async () => ({

@@ -141,6 +141,9 @@ model Device {
   updatedAt            DateTime              @updatedAt
   deviceGeofenceStates DeviceGeofenceState[]
 
+  // NEW: opposite relation for Cattle.currentDevice
+  cattleAssigned Cattle[] @relation("CattleCurrentDevice")
+
   ranch     Ranch?      @relation(fields: [ranchId], references: [id], onDelete: SetNull)
   telemetry Telemetry[]
   alerts    Alert[]
@@ -175,4 +178,31 @@ model Telemetry {
   device Device @relation(fields: [deviceId], references: [deviceId])
 
   @@index([deviceId, receivedAt])
+}
+
+model Cattle {
+  id            String    @id @default(cuid())
+  ranchId       String
+  name          String
+  dob           DateTime?
+  photoUrl      String?
+  lastCheckupAt DateTime?
+
+  // Lineage (self-relations)
+  motherId          String?
+  fatherId          String?
+  mother            Cattle?  @relation("CattleMother", fields: [motherId], references: [id])
+  father            Cattle?  @relation("CattleFather", fields: [fatherId], references: [id])
+  offspringAsMother Cattle[] @relation("CattleMother")
+  offspringAsFather Cattle[] @relation("CattleFather")
+
+  // Tag assignment (Device) — IMPORTANT: this uses Device.deviceId (not Device.id)
+  currentDeviceId String?
+  currentDevice   Device? @relation("CattleCurrentDevice", fields: [currentDeviceId], references: [deviceId])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ranchId])
+  @@index([currentDeviceId])
 }
