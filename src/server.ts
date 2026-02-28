@@ -7,7 +7,7 @@ import jwt from "@fastify/jwt";
 import rateLimit from "@fastify/rate-limit";
 import mqtt from "mqtt";
 import registerCattle from "./cattle.js";
-import { maybeBootstrapPostgis } from "./postgisBootstrap";
+import { maybeBootstrapPostgis } from "./postgisBootstrap.js";
 
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
