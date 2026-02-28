@@ -6,9 +6,8 @@ import websocket from "@fastify/websocket";
 import jwt from "@fastify/jwt";
 import rateLimit from "@fastify/rate-limit";
 import mqtt from "mqtt";
-
 import registerCattle from "./cattle.js";
-import { maybeBootstrapPostgis } from "./postgisBootstrap.js";
+import { maybeBootstrapPostgis } from "./postgisBootstrap";
 
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -20,9 +19,7 @@ import {
   verifyToken,
   type TokenPayload,
 } from "./auth.js";
-
 import { isInsideGeofence } from "./geofencing.js";
-
 import {
   generateInviteToken,
   getInviteExpiration,
@@ -36,7 +33,9 @@ import {
 const PORT = Number(process.env.PORT ?? 8080);
 
 const DATABASE_URL =
-  process.env.DATABASE_URL ?? (process.env as any).DATABASE_URLpostgresql ?? "";
+  process.env.DATABASE_URL ??
+  (process.env as any).DATABASE_URLpostgresql ??
+  "";
 
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
@@ -203,7 +202,7 @@ async function main() {
   console.log("Entered main()");
   const app = Fastify({ logger: true });
 
-  // 🔥 Enable PostGIS one-time when BOOTSTRAP_POSTGIS=true
+  // Enable PostGIS one-time when BOOTSTRAP_POSTGIS=true
   await maybeBootstrapPostgis();
 
   await app.register(jwt, { secret: JWT_SECRET });
@@ -211,7 +210,6 @@ async function main() {
   await app.register(cors, {
     origin: CORS_ORIGIN.split(",").map((o: string) => o.trim()),
     credentials: true,
-    // REQUIRED for DELETE / PUT / PATCH to work from browser
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Authorization", "Content-Type"],
   });
@@ -287,6 +285,49 @@ async function main() {
       api.get("/db-check", async () => {
         const result = await prisma.$queryRaw`SELECT 1 as status`;
         return result;
+      });
+
+      /* ----------------------------
+         ✅ PROPERTY LINES (AUTH)
+         GET /api/parcel-lines?bbox=minLon,minLat,maxLon,maxLat
+         Serves from parcel_lines table (recommended).
+      ---------------------------- */
+      api.get("/parcel-lines", async (req, reply) => {
+        const payload = await authenticate(req, reply);
+        if (!payload) return;
+
+        const bboxStr = String((req.query as any)?.bbox ?? "");
+        const parts = bboxStr.split(",").map((n) => Number(n.trim()));
+        if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) {
+          return reply.code(400).send({ error: "bbox must be minLon,minLat,maxLon,maxLat" });
+        }
+
+        const [minLon, minLat, maxLon, maxLat] = parts;
+
+        // Safety: prevent massive queries
+        const MAX_DEG = 0.5; // ~55km
+        if (Math.abs(maxLon - minLon) > MAX_DEG || Math.abs(maxLat - minLat) > MAX_DEG) {
+          return reply.code(400).send({ error: "bbox too large; zoom in" });
+        }
+
+        // Query parcel_lines (outlines)
+        const rows = await prisma.$queryRaw<{ id: number; geojson: any }[]>`
+          SELECT
+            id,
+            ST_AsGeoJSON(geom)::json AS geojson
+          FROM parcel_lines
+          WHERE geom && ST_MakeEnvelope(${minLon}, ${minLat}, ${maxLon}, ${maxLat}, 4326)
+          LIMIT 6000;
+        `;
+
+        return {
+          type: "FeatureCollection",
+          features: rows.map((r) => ({
+            type: "Feature",
+            properties: { id: r.id },
+            geometry: r.geojson,
+          })),
+        };
       });
 
       /* ----------------------------
@@ -387,7 +428,7 @@ async function main() {
 
         if (!user) return reply.code(404).send({ error: "User not found" });
 
-        const ranchId = user.ownedRanches[0]?.id ?? user.memberships?.[0]?.ranchId ?? null;
+        const ranchId = user.ownedRanches[0]?.id ?? user.memberships[0]?.ranchId ?? null;
         const ranch = ranchId ? await prisma.ranch.findUnique({ where: { id: ranchId } }) : null;
 
         return {
@@ -426,7 +467,6 @@ async function main() {
         return devices;
       });
 
-      // ✅ Unclaimed devices (AUTH)
       api.get("/devices/unclaimed", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -447,7 +487,6 @@ async function main() {
         return rows;
       });
 
-      // ✅ Claim a device to the caller’s ranch (AUTH)
       api.post("/devices/claim", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -487,7 +526,6 @@ async function main() {
         return { ok: true, device: updated };
       });
 
-      // Optional convenience
       api.get("/devices/:deviceId/latest", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -507,11 +545,6 @@ async function main() {
         return latest;
       });
 
-      /* ----------------------------
-         ✅ LIVE DATA (AUTH)
-         GET /api/live/latest
-      ---------------------------- */
-
       api.get("/live/latest", async (req, reply) => {
         const payload = await authenticate(req, reply);
         if (!payload) return;
@@ -527,14 +560,11 @@ async function main() {
         if (deviceIds.length === 0) return [];
 
         const rows = await prisma.telemetry.findMany({
-          where: {
-            deviceId: { in: deviceIds },
-          },
+          where: { deviceId: { in: deviceIds } },
           orderBy: { receivedAt: "desc" },
           take: 200,
         });
 
-        // Match UI shape
         return rows
           .filter((t) => t.lat != null && t.lon != null)
           .map((t) => ({
@@ -551,10 +581,6 @@ async function main() {
             fCnt: t.fCnt ?? null,
           }));
       });
-
-      /* ----------------------------
-         GEOFENCES (AUTH)
-      ---------------------------- */
 
       api.get("/geofences", async (req, reply) => {
         const payload = await authenticate(req, reply);
@@ -591,8 +617,7 @@ async function main() {
         }
 
         if (type === "polygon") {
-          if (!polygon)
-            return reply.code(400).send({ error: "polygon requires polygon coordinates" });
+          if (!polygon) return reply.code(400).send({ error: "polygon requires polygon coordinates" });
         }
 
         const fence = await prisma.geofence.create({
@@ -624,10 +649,6 @@ async function main() {
         await prisma.geofence.delete({ where: { id } });
         return { ok: true };
       });
-
-      /* ----------------------------
-         ALERTS (AUTH)
-      ---------------------------- */
 
       api.get("/alerts", async (req, reply) => {
         const payload = await authenticate(req, reply);
@@ -677,10 +698,6 @@ async function main() {
 
         return { ok: true };
       });
-
-      /* ----------------------------
-         TEAM / INVITES (AUTH)
-      ---------------------------- */
 
       api.get("/team/members", async (req, reply) => {
         const payload = await authenticate(req, reply);
@@ -841,7 +858,6 @@ async function main() {
           return;
         }
 
-        // Upsert device (IMPORTANT: ranchId stays null until claimed)
         await prisma.device.upsert({
           where: { deviceId: n.deviceId },
           create: {
@@ -856,7 +872,6 @@ async function main() {
           },
         });
 
-        // Store telemetry
         await prisma.telemetry.create({
           data: {
             deviceId: n.deviceId,
@@ -876,7 +891,6 @@ async function main() {
           },
         });
 
-        // Geofence ENTER/EXIT alerts (per-geofence transition tracking)
         if (n.lat != null && n.lon != null) {
           const device = await prisma.device.findUnique({
             where: { deviceId: n.deviceId },
@@ -908,7 +922,6 @@ async function main() {
                 },
               });
 
-              // First time seeing this pairing: seed state, no alert
               if (!prev) {
                 await prisma.deviceGeofenceState.create({
                   data: { deviceId: n.deviceId, geofenceId: gf.id, isInside: insideNow },
@@ -916,12 +929,10 @@ async function main() {
                 continue;
               }
 
-              // No transition
               if (prev.isInside === insideNow) continue;
 
               const type = insideNow ? "geofence_enter" : "geofence_exit";
 
-              // Debounce: prevent boundary jitter from spamming alerts
               const recent = await prisma.alert.findFirst({
                 where: {
                   ranchId: device.ranchId,
@@ -970,7 +981,6 @@ async function main() {
                 );
               }
 
-              // Update last-known state
               await prisma.deviceGeofenceState.update({
                 where: { deviceId_geofenceId: { deviceId: n.deviceId, geofenceId: gf.id } },
                 data: { isInside: insideNow },
@@ -979,7 +989,6 @@ async function main() {
           }
         }
 
-        // Broadcast to live UI
         broadcast({ type: "uplink", data: n });
         app.log.info({ deviceId: n.deviceId, lat: n.lat, lon: n.lon }, "Uplink saved");
       } catch (err) {
